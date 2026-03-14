@@ -192,7 +192,10 @@ impl GatewayController {
     }
 
     async fn run_gateway_controller(&self) -> Result<(), GatewayError> {
-        let reconciler = Arc::new(GatewayReconciler::new(self.client.clone()));
+        let reconciler = Arc::new(GatewayReconciler::new(
+            self.client.clone(),
+            Arc::clone(&self.reference_grants),
+        ));
         let api: Api<Gateway> = Api::all(self.client.clone());
 
         Controller::new(api, watcher::Config::default())

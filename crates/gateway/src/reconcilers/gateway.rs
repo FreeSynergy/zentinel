@@ -1,35 +1,39 @@
 //! Gateway reconciler.
 //!
 //! Watches Gateway resources and translates them into Zentinel listener
-//! configurations. Updates Gateway status with addresses and conditions.
+//! configurations. Updates Gateway status with addresses, listener conditions,
+//! and attached route counts.
 
 use gateway_api::gatewayclasses::GatewayClass;
-use gateway_api::gateways::Gateway;
+use gateway_api::gateways::{Gateway, GatewayListeners};
 use gateway_api::httproutes::HTTPRoute;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Client, ResourceExt};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::gateway_class::CONTROLLER_NAME;
 use crate::error::GatewayError;
+use crate::reconcilers::ReferenceGrantIndex;
 
 /// Reconciler for Gateway resources.
 pub struct GatewayReconciler {
     client: Client,
+    reference_grants: Arc<ReferenceGrantIndex>,
 }
 
 impl GatewayReconciler {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(client: Client, reference_grants: Arc<ReferenceGrantIndex>) -> Self {
+        Self {
+            client,
+            reference_grants,
+        }
     }
 
-    /// Reconcile a Gateway resource.
-    ///
-    /// Verifies the Gateway references a GatewayClass we own, then
-    /// translates listeners and updates status.
     pub async fn reconcile(
         &self,
         gateway: Arc<Gateway>,
@@ -38,23 +42,12 @@ impl GatewayReconciler {
         let namespace = gateway.namespace().unwrap_or_else(|| "default".into());
         let class_name = &gateway.spec.gateway_class_name;
 
-        // Check if the referenced GatewayClass belongs to us
         if !self.is_our_gateway_class(class_name).await? {
-            debug!(
-                name = %name,
-                namespace = %namespace,
-                class = %class_name,
-                "Ignoring Gateway for unowned GatewayClass"
-            );
+            debug!(name = %name, class = %class_name, "Ignoring Gateway for unowned GatewayClass");
             return Ok(Action::await_change());
         }
 
         let generation = gateway.metadata.generation.unwrap_or(0);
-
-        // Note: we do NOT skip based on generation alone here because
-        // attached route counts can change without the Gateway's generation
-        // changing (HTTPRoutes are separate resources). We always recompute
-        // status but use a requeue interval to avoid tight loops.
 
         info!(
             name = %name,
@@ -64,53 +57,41 @@ impl GatewayReconciler {
             "Reconciling Gateway"
         );
 
-        // Update Gateway status with listener info and attached route counts
         self.update_status(&gateway, &namespace).await?;
 
-        // Requeue periodically to pick up changes in attached route counts
-        // (HTTPRoutes are separate resources, their changes don't trigger
-        // Gateway reconciliation directly)
+        // Requeue to pick up route count and address changes
         Ok(Action::requeue(std::time::Duration::from_secs(10)))
     }
 
-    /// Check if a GatewayClass name belongs to our controller.
     async fn is_our_gateway_class(&self, class_name: &str) -> Result<bool, GatewayError> {
         let api: Api<GatewayClass> = Api::all(self.client.clone());
         match api.get(class_name).await {
             Ok(gc) => Ok(gc.spec.controller_name == CONTROLLER_NAME),
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                debug!(class = %class_name, "GatewayClass not found");
-                Ok(false)
-            }
+            Err(kube::Error::Api(err)) if err.code == 404 => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Count attached HTTPRoutes per listener for this Gateway.
+    /// Count attached HTTPRoutes per listener section name.
     async fn count_attached_routes(
         &self,
         gw_name: &str,
         gw_namespace: &str,
-    ) -> Result<std::collections::HashMap<String, i32>, GatewayError> {
+    ) -> Result<HashMap<String, i32>, GatewayError> {
         let route_api: Api<HTTPRoute> = Api::all(self.client.clone());
         let routes = route_api.list(&ListParams::default()).await?;
 
-        let mut counts: std::collections::HashMap<String, i32> =
-            std::collections::HashMap::new();
+        let mut counts: HashMap<String, i32> = HashMap::new();
 
         for route in &routes.items {
-            let parent_refs = route.spec.parent_refs.as_ref();
-            if let Some(refs) = parent_refs {
+            if let Some(refs) = route.spec.parent_refs.as_ref() {
                 for pr in refs {
                     let route_ns = route.namespace().unwrap_or_default();
                     let pr_ns = pr.namespace.as_deref().unwrap_or(&route_ns);
                     if pr.name == gw_name && pr_ns == gw_namespace {
-                        // If sectionName is specified, count for that listener
-                        // Otherwise, count for all listeners
                         if let Some(ref section) = pr.section_name {
                             *counts.entry(section.clone()).or_insert(0) += 1;
                         } else {
-                            // Attach to all listeners (use empty string as wildcard key)
                             *counts.entry(String::new()).or_insert(0) += 1;
                         }
                     }
@@ -121,7 +102,169 @@ impl GatewayReconciler {
         Ok(counts)
     }
 
-    /// Update Gateway status conditions and addresses.
+    /// Look up the proxy Service to find its external address.
+    async fn get_gateway_addresses(
+        &self,
+        namespace: &str,
+    ) -> Vec<serde_json::Value> {
+        // Try to find the proxy service (named <release>-proxy in the same namespace,
+        // or fall back to any Service with our labels)
+        let svc_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let services = match svc_api.list(&ListParams::default()).await {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        let mut addresses = Vec::new();
+
+        for svc in &services.items {
+            // Check LoadBalancer ingress
+            if let Some(ref status) = svc.status {
+                if let Some(ref lb) = status.load_balancer {
+                    if let Some(ref ingress) = lb.ingress {
+                        for ig in ingress {
+                            if let Some(ref ip) = ig.ip {
+                                addresses.push(json!({
+                                    "type": "IPAddress",
+                                    "value": ip,
+                                }));
+                            }
+                            if let Some(ref hostname) = ig.hostname {
+                                addresses.push(json!({
+                                    "type": "Hostname",
+                                    "value": hostname,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // For kind/NodePort, use ClusterIP as fallback
+            if addresses.is_empty() {
+                if let Some(ref spec) = svc.spec {
+                    if let Some(ref cluster_ip) = spec.cluster_ip {
+                        if cluster_ip != "None" && !cluster_ip.is_empty() {
+                            addresses.push(json!({
+                                "type": "IPAddress",
+                                "value": cluster_ip,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            if !addresses.is_empty() {
+                break; // Use first service with an address
+            }
+        }
+
+        addresses
+    }
+
+    /// Validate a listener's TLS certificateRefs.
+    /// Returns (resolved: bool, reason: &str, message: String).
+    async fn validate_listener_tls(
+        &self,
+        listener: &GatewayListeners,
+        gw_namespace: &str,
+    ) -> (bool, &'static str, String) {
+        let tls = match &listener.tls {
+            Some(t) => t,
+            None => return (true, "ResolvedRefs", "No TLS refs to resolve".into()),
+        };
+
+        let cert_refs = match &tls.certificate_refs {
+            Some(refs) if !refs.is_empty() => refs,
+            _ => return (true, "ResolvedRefs", "No certificate refs".into()),
+        };
+
+        for cert_ref in cert_refs {
+            // Check group/kind validity
+            let group = cert_ref.group.as_deref().unwrap_or("");
+            let kind = cert_ref.kind.as_deref().unwrap_or("Secret");
+
+            if !group.is_empty() && group != "core" {
+                return (
+                    false,
+                    "InvalidCertificateRef",
+                    format!("Unsupported certificateRef group: {group}"),
+                );
+            }
+            if kind != "Secret" {
+                return (
+                    false,
+                    "InvalidCertificateRef",
+                    format!("Unsupported certificateRef kind: {kind}"),
+                );
+            }
+
+            let secret_ns = cert_ref
+                .namespace
+                .as_deref()
+                .unwrap_or(gw_namespace);
+
+            // Cross-namespace check
+            if secret_ns != gw_namespace
+                && !self.reference_grants.is_permitted(
+                    gw_namespace,
+                    "Gateway",
+                    secret_ns,
+                    "Secret",
+                    &cert_ref.name,
+                )
+            {
+                return (
+                    false,
+                    "RefNotPermitted",
+                    format!(
+                        "Cross-namespace reference to Secret {}/{} not permitted",
+                        secret_ns, cert_ref.name
+                    ),
+                );
+            }
+
+            // Check Secret exists
+            let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), secret_ns);
+            match secret_api.get(&cert_ref.name).await {
+                Ok(secret) => {
+                    // Verify it has tls.crt and tls.key
+                    let has_data = secret
+                        .data
+                        .as_ref()
+                        .is_some_and(|d| d.contains_key("tls.crt") && d.contains_key("tls.key"));
+                    if !has_data {
+                        return (
+                            false,
+                            "InvalidCertificateRef",
+                            format!(
+                                "Secret {}/{} missing tls.crt or tls.key",
+                                secret_ns, cert_ref.name
+                            ),
+                        );
+                    }
+                }
+                Err(kube::Error::Api(err)) if err.code == 404 => {
+                    return (
+                        false,
+                        "InvalidCertificateRef",
+                        format!("Secret {}/{} not found", secret_ns, cert_ref.name),
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Error checking TLS Secret");
+                    return (
+                        false,
+                        "InvalidCertificateRef",
+                        format!("Error resolving Secret: {e}"),
+                    );
+                }
+            }
+        }
+
+        (true, "ResolvedRefs", "All certificate references resolved".into())
+    }
+
     async fn update_status(
         &self,
         gateway: &Gateway,
@@ -131,53 +274,55 @@ impl GatewayReconciler {
         let generation = gateway.metadata.generation.unwrap_or(0);
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Count attached routes per listener
         let attached_counts = self.count_attached_routes(&name, namespace).await?;
         let wildcard_count = attached_counts.get("").copied().unwrap_or(0);
+        let addresses = self.get_gateway_addresses(namespace).await;
 
-        // Build listener statuses
-        let listener_statuses: Vec<serde_json::Value> = gateway
-            .spec
-            .listeners
-            .iter()
-            .map(|l| {
-                let listener_count = attached_counts
-                    .get(&l.name)
-                    .copied()
-                    .unwrap_or(0)
-                    + wildcard_count;
+        // Build listener statuses with per-listener TLS validation
+        let mut listener_statuses = Vec::new();
+        for l in &gateway.spec.listeners {
+            let listener_count = attached_counts
+                .get(&l.name)
+                .copied()
+                .unwrap_or(0)
+                + wildcard_count;
 
-                json!({
-                    "name": l.name,
-                    "attachedRoutes": listener_count,
-                    "supportedKinds": supported_route_kinds(&l.protocol),
-                    "conditions": [{
-                        "type": "Accepted",
-                        "status": "True",
-                        "reason": "Accepted",
-                        "message": "Listener accepted",
-                        "observedGeneration": generation,
-                        "lastTransitionTime": now,
-                    }, {
-                        "type": "Programmed",
-                        "status": "True",
-                        "reason": "Programmed",
-                        "message": "Listener programmed in Zentinel",
-                        "observedGeneration": generation,
-                        "lastTransitionTime": now,
-                    }, {
-                        "type": "ResolvedRefs",
-                        "status": "True",
-                        "reason": "ResolvedRefs",
-                        "message": "All references resolved",
-                        "observedGeneration": generation,
-                        "lastTransitionTime": now,
-                    }]
-                })
-            })
-            .collect();
+            let (refs_resolved, refs_reason, refs_message) =
+                self.validate_listener_tls(l, namespace).await;
 
-        let status = json!({
+            // If TLS is invalid, listener is not programmed
+            let programmed = refs_resolved;
+
+            listener_statuses.push(json!({
+                "name": l.name,
+                "attachedRoutes": listener_count,
+                "supportedKinds": supported_route_kinds(&l.protocol),
+                "conditions": [{
+                    "type": "Accepted",
+                    "status": "True",
+                    "reason": "Accepted",
+                    "message": "Listener accepted",
+                    "observedGeneration": generation,
+                    "lastTransitionTime": now,
+                }, {
+                    "type": "Programmed",
+                    "status": if programmed { "True" } else { "False" },
+                    "reason": if programmed { "Programmed" } else { refs_reason },
+                    "message": if programmed { "Listener programmed" } else { &refs_message },
+                    "observedGeneration": generation,
+                    "lastTransitionTime": now,
+                }, {
+                    "type": "ResolvedRefs",
+                    "status": if refs_resolved { "True" } else { "False" },
+                    "reason": refs_reason,
+                    "message": refs_message,
+                    "observedGeneration": generation,
+                    "lastTransitionTime": now,
+                }]
+            }));
+        }
+
+        let mut status = json!({
             "status": {
                 "conditions": [{
                     "type": "Accepted",
@@ -198,6 +343,11 @@ impl GatewayReconciler {
             }
         });
 
+        // Add addresses if available
+        if !addresses.is_empty() {
+            status["status"]["addresses"] = json!(addresses);
+        }
+
         let api: Api<Gateway> = Api::namespaced(self.client.clone(), namespace);
         api.patch_status(
             &name,
@@ -209,7 +359,6 @@ impl GatewayReconciler {
         Ok(())
     }
 
-    /// Handle errors during reconciliation.
     pub fn error_policy(
         _obj: Arc<Gateway>,
         error: &GatewayError,
@@ -220,7 +369,6 @@ impl GatewayReconciler {
     }
 }
 
-/// Return the supported route kinds for a given listener protocol.
 fn supported_route_kinds(protocol: &str) -> Vec<serde_json::Value> {
     match protocol {
         "HTTP" | "HTTPS" => vec![
