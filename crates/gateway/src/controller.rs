@@ -1,0 +1,213 @@
+//! Main controller that wires together all reconcilers and runs them.
+
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use futures::StreamExt;
+use gateway_api::gatewayclasses::GatewayClass;
+use gateway_api::gateways::Gateway;
+use gateway_api::httproutes::HTTPRoute;
+use gateway_api::referencegrants::ReferenceGrant;
+use kube::api::ListParams;
+use kube::runtime::controller::Controller;
+use kube::runtime::watcher;
+use kube::{Api, Client};
+use tracing::{error, info};
+
+use zentinel_config::Config;
+
+use crate::error::GatewayError;
+use crate::reconcilers::{
+    GatewayClassReconciler, GatewayReconciler, HttpRouteReconciler, ReferenceGrantIndex,
+};
+use crate::translator::ConfigTranslator;
+
+/// The main Gateway API controller.
+///
+/// Runs reconciliation loops for GatewayClass, Gateway, HTTPRoute, and
+/// ReferenceGrant resources. Produces a `zentinel_config::Config` that
+/// the proxy data plane can consume.
+pub struct GatewayController {
+    client: Client,
+    config: Arc<ArcSwap<Config>>,
+    reference_grants: Arc<ReferenceGrantIndex>,
+}
+
+impl GatewayController {
+    /// Create a new controller.
+    pub async fn new() -> Result<Self, GatewayError> {
+        let client = Client::try_default().await?;
+        let config = Arc::new(ArcSwap::from_pointee(Config::default_for_testing()));
+        let reference_grants = Arc::new(ReferenceGrantIndex::new());
+
+        Ok(Self {
+            client,
+            config,
+            reference_grants,
+        })
+    }
+
+    /// Create a controller with a pre-existing config store (for integration
+    /// with an existing Zentinel proxy instance).
+    pub fn with_config(client: Client, config: Arc<ArcSwap<Config>>) -> Self {
+        let reference_grants = Arc::new(ReferenceGrantIndex::new());
+        Self {
+            client,
+            config,
+            reference_grants,
+        }
+    }
+
+    /// Get a handle to the shared config (for the data plane to read).
+    pub fn config_handle(&self) -> Arc<ArcSwap<Config>> {
+        Arc::clone(&self.config)
+    }
+
+    /// Run all reconciliation loops until shutdown.
+    ///
+    /// This spawns separate tasks for each resource type and waits for
+    /// all of them. Cancellation is handled via tokio's cooperative
+    /// cancellation (dropping the future).
+    pub async fn run(self) -> Result<(), GatewayError> {
+        let translator = Arc::new(ConfigTranslator::new(
+            Arc::clone(&self.config),
+            Arc::clone(&self.reference_grants),
+        ));
+
+        info!("Starting Gateway API controller");
+
+        // Build initial ReferenceGrant index
+        self.rebuild_reference_grants().await?;
+
+        // Run all controllers concurrently
+        let gateway_class_fut = self.run_gateway_class_controller();
+        let gateway_fut = self.run_gateway_controller();
+        let httproute_fut = self.run_httproute_controller(Arc::clone(&translator));
+        let refgrant_fut = self.run_reference_grant_watcher();
+
+        tokio::select! {
+            res = gateway_class_fut => {
+                error!("GatewayClass controller exited: {:?}", res);
+            }
+            res = gateway_fut => {
+                error!("Gateway controller exited: {:?}", res);
+            }
+            res = httproute_fut => {
+                error!("HTTPRoute controller exited: {:?}", res);
+            }
+            res = refgrant_fut => {
+                error!("ReferenceGrant watcher exited: {:?}", res);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_gateway_class_controller(&self) -> Result<(), GatewayError> {
+        let reconciler = Arc::new(GatewayClassReconciler::new(self.client.clone()));
+        let api: Api<GatewayClass> = Api::all(self.client.clone());
+
+        Controller::new(api, watcher::Config::default())
+            .run(
+                move |obj, _ctx| {
+                    let reconciler = Arc::clone(&reconciler);
+                    async move { reconciler.reconcile(obj).await }
+                },
+                GatewayClassReconciler::error_policy,
+                Arc::new(()),
+            )
+            .for_each(|res| async move {
+                match res {
+                    Ok((_obj, _action)) => {}
+                    Err(e) => error!(error = %e, "GatewayClass reconciliation error"),
+                }
+            })
+            .await;
+
+        Ok(())
+    }
+
+    async fn run_gateway_controller(&self) -> Result<(), GatewayError> {
+        let reconciler = Arc::new(GatewayReconciler::new(self.client.clone()));
+        let api: Api<Gateway> = Api::all(self.client.clone());
+
+        Controller::new(api, watcher::Config::default())
+            .run(
+                move |obj, _ctx| {
+                    let reconciler = Arc::clone(&reconciler);
+                    async move { reconciler.reconcile(obj).await }
+                },
+                GatewayReconciler::error_policy,
+                Arc::new(()),
+            )
+            .for_each(|res| async move {
+                match res {
+                    Ok((_obj, _action)) => {}
+                    Err(e) => error!(error = %e, "Gateway reconciliation error"),
+                }
+            })
+            .await;
+
+        Ok(())
+    }
+
+    async fn run_httproute_controller(
+        &self,
+        translator: Arc<ConfigTranslator>,
+    ) -> Result<(), GatewayError> {
+        let reconciler = Arc::new(HttpRouteReconciler::new(self.client.clone(), translator));
+        let api: Api<HTTPRoute> = Api::all(self.client.clone());
+
+        Controller::new(api, watcher::Config::default())
+            .run(
+                move |obj, _ctx| {
+                    let reconciler = Arc::clone(&reconciler);
+                    async move { reconciler.reconcile(obj).await }
+                },
+                HttpRouteReconciler::error_policy,
+                Arc::new(()),
+            )
+            .for_each(|res| async move {
+                match res {
+                    Ok((_obj, _action)) => {}
+                    Err(e) => error!(error = %e, "HTTPRoute reconciliation error"),
+                }
+            })
+            .await;
+
+        Ok(())
+    }
+
+    /// Watch ReferenceGrant resources and rebuild the index on changes.
+    async fn run_reference_grant_watcher(&self) -> Result<(), GatewayError> {
+        use kube::runtime::watcher as kube_watcher;
+
+        let api: Api<ReferenceGrant> = Api::all(self.client.clone());
+        let mut stream =
+            kube_watcher::watcher(api, kube_watcher::Config::default()).boxed();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(_) => {
+                    // Rebuild on any change
+                    if let Err(e) = self.rebuild_reference_grants().await {
+                        error!(error = %e, "Failed to rebuild ReferenceGrant index");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "ReferenceGrant watch error");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild the ReferenceGrant index from cluster state.
+    async fn rebuild_reference_grants(&self) -> Result<(), GatewayError> {
+        let api: Api<ReferenceGrant> = Api::all(self.client.clone());
+        let grants = api.list(&ListParams::default()).await?;
+        self.reference_grants.rebuild(grants.items);
+        Ok(())
+    }
+}
