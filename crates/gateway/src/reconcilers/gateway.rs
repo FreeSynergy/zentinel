@@ -5,7 +5,8 @@
 
 use gateway_api::gatewayclasses::GatewayClass;
 use gateway_api::gateways::Gateway;
-use kube::api::{Api, Patch, PatchParams};
+use gateway_api::httproutes::HTTPRoute;
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::{Client, ResourceExt};
 use serde_json::json;
@@ -50,16 +51,10 @@ impl GatewayReconciler {
 
         let generation = gateway.metadata.generation.unwrap_or(0);
 
-        // Skip if we've already programmed this generation
-        if is_already_programmed(&gateway, generation) {
-            debug!(
-                name = %name,
-                namespace = %namespace,
-                generation,
-                "Gateway already programmed at this generation"
-            );
-            return Ok(Action::await_change());
-        }
+        // Note: we do NOT skip based on generation alone here because
+        // attached route counts can change without the Gateway's generation
+        // changing (HTTPRoutes are separate resources). We always recompute
+        // status but use a requeue interval to avoid tight loops.
 
         info!(
             name = %name,
@@ -69,10 +64,13 @@ impl GatewayReconciler {
             "Reconciling Gateway"
         );
 
-        // Update Gateway status
+        // Update Gateway status with listener info and attached route counts
         self.update_status(&gateway, &namespace).await?;
 
-        Ok(Action::await_change())
+        // Requeue periodically to pick up changes in attached route counts
+        // (HTTPRoutes are separate resources, their changes don't trigger
+        // Gateway reconciliation directly)
+        Ok(Action::requeue(std::time::Duration::from_secs(10)))
     }
 
     /// Check if a GatewayClass name belongs to our controller.
@@ -88,6 +86,41 @@ impl GatewayReconciler {
         }
     }
 
+    /// Count attached HTTPRoutes per listener for this Gateway.
+    async fn count_attached_routes(
+        &self,
+        gw_name: &str,
+        gw_namespace: &str,
+    ) -> Result<std::collections::HashMap<String, i32>, GatewayError> {
+        let route_api: Api<HTTPRoute> = Api::all(self.client.clone());
+        let routes = route_api.list(&ListParams::default()).await?;
+
+        let mut counts: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+
+        for route in &routes.items {
+            let parent_refs = route.spec.parent_refs.as_ref();
+            if let Some(refs) = parent_refs {
+                for pr in refs {
+                    let route_ns = route.namespace().unwrap_or_default();
+                    let pr_ns = pr.namespace.as_deref().unwrap_or(&route_ns);
+                    if pr.name == gw_name && pr_ns == gw_namespace {
+                        // If sectionName is specified, count for that listener
+                        // Otherwise, count for all listeners
+                        if let Some(ref section) = pr.section_name {
+                            *counts.entry(section.clone()).or_insert(0) += 1;
+                        } else {
+                            // Attach to all listeners (use empty string as wildcard key)
+                            *counts.entry(String::new()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(counts)
+    }
+
     /// Update Gateway status conditions and addresses.
     async fn update_status(
         &self,
@@ -98,15 +131,25 @@ impl GatewayReconciler {
         let generation = gateway.metadata.generation.unwrap_or(0);
         let now = chrono::Utc::now().to_rfc3339();
 
+        // Count attached routes per listener
+        let attached_counts = self.count_attached_routes(&name, namespace).await?;
+        let wildcard_count = attached_counts.get("").copied().unwrap_or(0);
+
         // Build listener statuses
         let listener_statuses: Vec<serde_json::Value> = gateway
             .spec
             .listeners
             .iter()
             .map(|l| {
+                let listener_count = attached_counts
+                    .get(&l.name)
+                    .copied()
+                    .unwrap_or(0)
+                    + wildcard_count;
+
                 json!({
                     "name": l.name,
-                    "attachedRoutes": 0,
+                    "attachedRoutes": listener_count,
                     "supportedKinds": supported_route_kinds(&l.protocol),
                     "conditions": [{
                         "type": "Accepted",
@@ -120,6 +163,13 @@ impl GatewayReconciler {
                         "status": "True",
                         "reason": "Programmed",
                         "message": "Listener programmed in Zentinel",
+                        "observedGeneration": generation,
+                        "lastTransitionTime": now,
+                    }, {
+                        "type": "ResolvedRefs",
+                        "status": "True",
+                        "reason": "ResolvedRefs",
+                        "message": "All references resolved",
                         "observedGeneration": generation,
                         "lastTransitionTime": now,
                     }]
@@ -140,7 +190,7 @@ impl GatewayReconciler {
                     "type": "Programmed",
                     "status": "True",
                     "reason": "Programmed",
-                    "message": "Gateway programmed — listeners active",
+                    "message": "Gateway programmed, listeners active",
                     "observedGeneration": generation,
                     "lastTransitionTime": now,
                 }],
@@ -168,28 +218,6 @@ impl GatewayReconciler {
         warn!(error = %error, "Gateway reconciliation failed");
         Action::requeue(std::time::Duration::from_secs(30))
     }
-}
-
-/// Check if the Gateway status already has Accepted=True and Programmed=True
-/// for the current generation.
-fn is_already_programmed(gw: &Gateway, generation: i64) -> bool {
-    let Some(ref status) = gw.status else {
-        return false;
-    };
-    let Some(ref conditions) = status.conditions else {
-        return false;
-    };
-    let has_accepted = conditions.iter().any(|c| {
-        c.type_ == "Accepted"
-            && c.status == "True"
-            && c.observed_generation == Some(generation)
-    });
-    let has_programmed = conditions.iter().any(|c| {
-        c.type_ == "Programmed"
-            && c.status == "True"
-            && c.observed_generation == Some(generation)
-    });
-    has_accepted && has_programmed
 }
 
 /// Return the supported route kinds for a given listener protocol.
