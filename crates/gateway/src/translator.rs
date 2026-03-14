@@ -22,9 +22,10 @@ use tracing::{debug, info, warn};
 
 use zentinel_common::types::{HealthCheckType, LoadBalancingAlgorithm, Priority, TlsVersion};
 use zentinel_config::{
-    Config, ConnectionPoolConfig, HeaderModifications, HealthCheck, HttpVersionConfig,
-    ListenerConfig, ListenerProtocol, MatchCondition, RouteConfig, RoutePolicies, ServerConfig,
-    ServiceType, SniCertificate, TlsConfig, UpstreamConfig, UpstreamTarget, UpstreamTimeouts,
+    Config, ConnectionPoolConfig, Filter, FilterConfig, HeaderModifications, HealthCheck,
+    HttpVersionConfig, ListenerConfig, ListenerProtocol, MatchCondition, PathModifier,
+    RedirectFilter, RouteConfig, RoutePolicies, ServerConfig, ServiceType, SniCertificate,
+    TlsConfig, UpstreamConfig, UpstreamTarget, UpstreamTimeouts, UrlRewriteFilter,
 };
 
 use crate::error::GatewayError;
@@ -101,6 +102,7 @@ impl ConfigTranslator {
         let mut listeners = Vec::new();
         let mut routes = Vec::new();
         let mut upstreams = HashMap::new();
+        let mut filters = HashMap::new();
 
         // Translate Gateways → Listeners (with TLS resolution)
         for gw in &our_gateways {
@@ -130,9 +132,11 @@ impl ConfigTranslator {
                 continue;
             }
 
-            let (route_configs, upstream_configs) = self.translate_httproute(route)?;
+            let (route_configs, upstream_configs, filter_configs) =
+                self.translate_httproute(route)?;
             routes.extend(route_configs);
             upstreams.extend(upstream_configs);
+            filters.extend(filter_configs);
         }
 
         // Translate GRPCRoutes → Routes + Upstreams
@@ -217,7 +221,7 @@ impl ConfigTranslator {
             listeners,
             routes,
             upstreams,
-            filters: HashMap::new(),
+            filters,
             agents: vec![],
             waf: None,
             namespaces: vec![],
@@ -377,17 +381,26 @@ impl ConfigTranslator {
         })
     }
 
-    /// Translate an HTTPRoute into Zentinel route and upstream configs.
+    /// Translate an HTTPRoute into Zentinel route, upstream, and filter configs.
+    #[allow(clippy::type_complexity)]
     fn translate_httproute(
         &self,
         route: &HTTPRoute,
-    ) -> Result<(Vec<RouteConfig>, HashMap<String, UpstreamConfig>), GatewayError> {
+    ) -> Result<
+        (
+            Vec<RouteConfig>,
+            HashMap<String, UpstreamConfig>,
+            HashMap<String, FilterConfig>,
+        ),
+        GatewayError,
+    > {
         let route_name = route.name_any();
         let route_ns = route.namespace().unwrap_or_else(|| "default".into());
 
         let rules = route.spec.rules.as_ref().cloned().unwrap_or_default();
         let mut route_configs = Vec::new();
         let mut upstream_configs = HashMap::new();
+        let mut filter_configs = HashMap::new();
 
         // Hostnames from the route spec
         let hostnames: Vec<String> = route
@@ -414,6 +427,21 @@ impl ConfigTranslator {
             let request_headers = self.extract_request_header_mods(&rule.filters);
             let response_headers = self.extract_response_header_mods(&rule.filters);
 
+            // Extract redirect and rewrite filters
+            let mut route_filter_ids = Vec::new();
+            self.extract_redirect_filters(
+                &rule.filters,
+                &rule_id,
+                &mut filter_configs,
+                &mut route_filter_ids,
+            );
+            self.extract_rewrite_filters(
+                &rule.filters,
+                &rule_id,
+                &mut filter_configs,
+                &mut route_filter_ids,
+            );
+
             let route_config = RouteConfig {
                 id: rule_id,
                 priority: Priority::Normal,
@@ -425,7 +453,7 @@ impl ConfigTranslator {
                     response_headers,
                     ..RoutePolicies::default()
                 },
-                filters: vec![],
+                filters: route_filter_ids,
                 builtin_handler: None,
                 waf_enabled: false,
                 circuit_breaker: None,
@@ -443,7 +471,7 @@ impl ConfigTranslator {
             route_configs.push(route_config);
         }
 
-        Ok((route_configs, upstream_configs))
+        Ok((route_configs, upstream_configs, filter_configs))
     }
 
     /// Translate HTTPRoute matches into Zentinel match conditions.
@@ -699,6 +727,127 @@ impl ConfigTranslator {
         }
 
         mods
+    }
+
+    /// Extract RequestRedirect filters and create Zentinel filter configs.
+    fn extract_redirect_filters(
+        &self,
+        rule_filters: &Option<Vec<HTTPRouteRulesFilters>>,
+        rule_id: &str,
+        filter_configs: &mut HashMap<String, FilterConfig>,
+        route_filter_ids: &mut Vec<String>,
+    ) {
+        let filters = match rule_filters {
+            Some(f) => f,
+            None => return,
+        };
+
+        for (i, filter) in filters.iter().enumerate() {
+            if filter.r#type != HTTPRouteRulesFiltersType::RequestRedirect {
+                continue;
+            }
+
+            let Some(ref redirect) = filter.request_redirect else {
+                continue;
+            };
+
+            let filter_id = format!("{rule_id}-redirect-{i}");
+
+            let scheme = redirect.scheme.as_ref().map(|s| {
+                serde_json::to_value(s)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("{s:?}"))
+            });
+
+            let status_code = redirect
+                .status_code
+                .map(|c| c as u16)
+                .unwrap_or(302);
+
+            let path = redirect.path.as_ref().map(|p| {
+                if let Some(ref full) = p.replace_full_path {
+                    PathModifier::ReplaceFullPath {
+                        value: full.clone(),
+                    }
+                } else if let Some(ref prefix) = p.replace_prefix_match {
+                    PathModifier::ReplacePrefixMatch {
+                        value: prefix.clone(),
+                    }
+                } else {
+                    PathModifier::ReplaceFullPath {
+                        value: "/".to_string(),
+                    }
+                }
+            });
+
+            let redirect_filter = RedirectFilter {
+                hostname: redirect.hostname.clone(),
+                status_code,
+                scheme,
+                port: redirect.port.map(|p| p as u16),
+                path,
+            };
+
+            filter_configs.insert(
+                filter_id.clone(),
+                FilterConfig::new(filter_id.clone(), Filter::Redirect(redirect_filter)),
+            );
+            route_filter_ids.push(filter_id);
+        }
+    }
+
+    /// Extract URLRewrite filters and create Zentinel filter configs.
+    fn extract_rewrite_filters(
+        &self,
+        rule_filters: &Option<Vec<HTTPRouteRulesFilters>>,
+        rule_id: &str,
+        filter_configs: &mut HashMap<String, FilterConfig>,
+        route_filter_ids: &mut Vec<String>,
+    ) {
+        let filters = match rule_filters {
+            Some(f) => f,
+            None => return,
+        };
+
+        for (i, filter) in filters.iter().enumerate() {
+            if filter.r#type != HTTPRouteRulesFiltersType::UrlRewrite {
+                continue;
+            }
+
+            let Some(ref rewrite) = filter.url_rewrite else {
+                continue;
+            };
+
+            let filter_id = format!("{rule_id}-rewrite-{i}");
+
+            let path = rewrite.path.as_ref().map(|p| {
+                if let Some(ref full) = p.replace_full_path {
+                    PathModifier::ReplaceFullPath {
+                        value: full.clone(),
+                    }
+                } else if let Some(ref prefix) = p.replace_prefix_match {
+                    PathModifier::ReplacePrefixMatch {
+                        value: prefix.clone(),
+                    }
+                } else {
+                    PathModifier::ReplaceFullPath {
+                        value: "/".to_string(),
+                    }
+                }
+            });
+
+            let rewrite_filter = UrlRewriteFilter {
+                hostname: rewrite.hostname.clone(),
+                path,
+            };
+
+            filter_configs.insert(
+                filter_id.clone(),
+                FilterConfig::new(filter_id.clone(), Filter::UrlRewrite(rewrite_filter)),
+            );
+            route_filter_ids.push(filter_id);
+        }
     }
 
     // ========================================================================
