@@ -179,10 +179,17 @@ impl ConfigTranslator {
         }
 
         // Translate TLSRoutes → Routes + Upstreams (SNI passthrough)
+        // Non-fatal: TLSRoute is experimental and the CRD may not be installed
         let tls_api: Api<TLSRoute> = Api::all(client.clone());
-        let all_tls_routes = tls_api.list(&ListParams::default()).await?;
+        let all_tls_routes = match tls_api.list(&ListParams::default()).await {
+            Ok(routes) => routes.items,
+            Err(e) => {
+                debug!(error = %e, "TLSRoute listing failed (experimental CRD may not be available)");
+                vec![]
+            }
+        };
 
-        for route in &all_tls_routes.items {
+        for route in &all_tls_routes {
             let parent_refs = route.spec.parent_refs.as_ref();
             let is_ours = parent_refs.is_some_and(|refs: &Vec<gateway_api::experimental::tlsroutes::TLSRouteParentRefs>| {
                 refs.iter().any(|pr: &gateway_api::experimental::tlsroutes::TLSRouteParentRefs| {
@@ -207,8 +214,14 @@ impl ConfigTranslator {
         // Translate legacy Ingress resources (compatibility shim)
         let ingress_api: Api<k8s_openapi::api::networking::v1::Ingress> =
             Api::all(client.clone());
-        let all_ingresses = ingress_api.list(&ListParams::default()).await?;
-        let (ingress_routes, ingress_upstreams) = translate_ingresses(&all_ingresses.items);
+        let ingress_items = match ingress_api.list(&ListParams::default()).await {
+            Ok(list) => list.items,
+            Err(e) => {
+                debug!(error = %e, "Ingress listing failed");
+                vec![]
+            }
+        };
+        let (ingress_routes, ingress_upstreams) = translate_ingresses(&ingress_items);
         routes.extend(ingress_routes);
         upstreams.extend(ingress_upstreams);
 

@@ -110,6 +110,11 @@ impl GatewayReconciler {
         &self,
         _namespace: &str,
     ) -> Vec<serde_json::Value> {
+        // Check for override via environment variable (for kind/test environments)
+        if let Ok(addr) = std::env::var("GATEWAY_ADDRESS") {
+            return vec![json!({"type": "IPAddress", "value": addr})];
+        }
+
         // Search all namespaces for our proxy Service (labeled by Helm)
         let svc_api: Api<Service> = Api::all(self.client.clone());
         let params = ListParams::default()
