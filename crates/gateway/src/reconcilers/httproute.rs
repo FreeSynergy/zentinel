@@ -73,6 +73,36 @@ impl HttpRouteReconciler {
                 None => continue,
             };
 
+            // Check sectionName matches a listener
+            if let Some(ref section_name) = parent_ref.section_name {
+                let has_listener = gw
+                    .spec
+                    .listeners
+                    .iter()
+                    .any(|l| l.name == *section_name);
+                if !has_listener {
+                    parent_statuses.push(json!({
+                        "parentRef": {
+                            "group": "gateway.networking.k8s.io",
+                            "kind": "Gateway",
+                            "name": gw_name,
+                            "namespace": gw_namespace,
+                            "sectionName": section_name,
+                        },
+                        "controllerName": CONTROLLER_NAME,
+                        "conditions": [{
+                            "type": "Accepted",
+                            "status": "False",
+                            "reason": "NoMatchingParent",
+                            "message": format!("No listener named '{section_name}' found on Gateway"),
+                            "observedGeneration": generation,
+                            "lastTransitionTime": now,
+                        }]
+                    }));
+                    continue;
+                }
+            }
+
             // Check cross-namespace parent ref permission
             if gw_namespace != namespace {
                 let allowed = self.is_parent_ref_allowed(&gw, &namespace);
@@ -279,22 +309,39 @@ impl HttpRouteReconciler {
 
                 // Check cross-namespace permission
                 let backend_ns = backend.namespace.as_deref().unwrap_or(route_ns);
-                if backend_ns != route_ns {
-                    let backend_name = &backend.name;
-                    if !self.reference_grants.is_permitted(
+                let backend_name = &backend.name;
+                if backend_ns != route_ns
+                    && !self.reference_grants.is_permitted(
                         route_ns,
                         "HTTPRoute",
                         backend_ns,
                         "Service",
                         backend_name,
-                    ) {
+                    )
+                {
+                    return (
+                        false,
+                        "RefNotPermitted",
+                        format!(
+                            "Cross-namespace reference to {backend_ns}/{backend_name} not permitted"
+                        ),
+                    );
+                }
+
+                // Check Service exists
+                let svc_api: Api<k8s_openapi::api::core::v1::Service> =
+                    Api::namespaced(self.client.clone(), backend_ns);
+                match svc_api.get(backend_name).await {
+                    Ok(_) => {}
+                    Err(kube::Error::Api(err)) if err.code == 404 => {
                         return (
                             false,
-                            "RefNotPermitted",
-                            format!(
-                                "Cross-namespace reference to {backend_ns}/{backend_name} not permitted"
-                            ),
+                            "BackendNotFound",
+                            format!("Service {backend_ns}/{backend_name} not found"),
                         );
+                    }
+                    Err(_) => {
+                        // Non-fatal API error, treat as resolved
                     }
                 }
             }
