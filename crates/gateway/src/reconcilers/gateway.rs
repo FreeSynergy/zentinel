@@ -283,7 +283,7 @@ impl GatewayReconciler {
         let wildcard_count = attached_counts.get("").copied().unwrap_or(0);
         let addresses = self.get_gateway_addresses(namespace).await;
 
-        // Build listener statuses with per-listener TLS validation
+        // Build listener statuses with per-listener validation
         let mut listener_statuses = Vec::new();
         for l in &gateway.spec.listeners {
             let listener_count = attached_counts
@@ -292,16 +292,29 @@ impl GatewayReconciler {
                 .unwrap_or(0)
                 + wildcard_count;
 
-            let (refs_resolved, refs_reason, refs_message) =
+            // Validate TLS certificate refs
+            let (tls_resolved, tls_reason, tls_message) =
                 self.validate_listener_tls(l, namespace).await;
 
-            // If TLS is invalid, listener is not programmed
+            // Validate allowed route kinds
+            let (kinds_valid, kinds_reason, kinds_message, filtered_kinds) =
+                validate_listener_route_kinds(l);
+
+            // Combine: refs are resolved only if both TLS and kinds are valid
+            let (refs_resolved, refs_reason, refs_message) = if !kinds_valid {
+                (false, kinds_reason, kinds_message)
+            } else if !tls_resolved {
+                (false, tls_reason, tls_message)
+            } else {
+                (true, "ResolvedRefs", "All references resolved".to_string())
+            };
+
             let programmed = refs_resolved;
 
             listener_statuses.push(json!({
                 "name": l.name,
                 "attachedRoutes": listener_count,
-                "supportedKinds": supported_route_kinds(&l.protocol),
+                "supportedKinds": filtered_kinds,
                 "conditions": [{
                     "type": "Accepted",
                     "status": "True",
@@ -312,7 +325,7 @@ impl GatewayReconciler {
                 }, {
                     "type": "Programmed",
                     "status": if programmed { "True" } else { "False" },
-                    "reason": if programmed { "Programmed" } else { refs_reason },
+                    "reason": if programmed { "Programmed" } else { &refs_reason },
                     "message": if programmed { "Listener programmed" } else { &refs_message },
                     "observedGeneration": generation,
                     "lastTransitionTime": now,
@@ -371,6 +384,59 @@ impl GatewayReconciler {
     ) -> Action {
         warn!(error = %error, "Gateway reconciliation failed");
         Action::requeue(std::time::Duration::from_secs(30))
+    }
+}
+
+/// Validate allowed route kinds on a listener.
+///
+/// If the listener specifies `allowedRoutes.kinds`, check that they reference
+/// valid route types. Returns (valid, reason, message, filtered_supported_kinds).
+fn validate_listener_route_kinds(
+    listener: &GatewayListeners,
+) -> (bool, &'static str, String, Vec<serde_json::Value>) {
+    let default_kinds = supported_route_kinds(&listener.protocol);
+
+    let allowed = listener
+        .allowed_routes
+        .as_ref()
+        .and_then(|ar| ar.kinds.as_ref());
+
+    let Some(kinds) = allowed else {
+        // No explicit kinds = use defaults, all valid
+        return (true, "ResolvedRefs", "All references resolved".into(), default_kinds);
+    };
+
+    if kinds.is_empty() {
+        return (true, "ResolvedRefs", "All references resolved".into(), default_kinds);
+    }
+
+    let valid_kinds = ["HTTPRoute", "GRPCRoute", "TLSRoute", "TCPRoute", "UDPRoute"];
+    let mut has_invalid = false;
+    let mut filtered = Vec::new();
+
+    for kind in kinds {
+        let kind_name = &kind.kind;
+        let group = kind.group.as_deref().unwrap_or("gateway.networking.k8s.io");
+
+        if group == "gateway.networking.k8s.io" && valid_kinds.contains(&kind_name.as_str()) {
+            filtered.push(json!({
+                "group": group,
+                "kind": kind_name,
+            }));
+        } else {
+            has_invalid = true;
+        }
+    }
+
+    if has_invalid {
+        (
+            false,
+            "InvalidRouteKinds",
+            "One or more route kinds are not supported".into(),
+            filtered,
+        )
+    } else {
+        (true, "ResolvedRefs", "All references resolved".into(), filtered)
     }
 }
 

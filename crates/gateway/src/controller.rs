@@ -222,7 +222,11 @@ impl GatewayController {
         &self,
         translator: Arc<ConfigTranslator>,
     ) -> Result<(), GatewayError> {
-        let reconciler = Arc::new(HttpRouteReconciler::new(self.client.clone(), translator));
+        let reconciler = Arc::new(HttpRouteReconciler::new(
+            self.client.clone(),
+            translator,
+            Arc::clone(&self.reference_grants),
+        ));
         let api: Api<HTTPRoute> = Api::all(self.client.clone());
 
         Controller::new(api, watcher::Config::default())
