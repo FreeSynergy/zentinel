@@ -1,0 +1,158 @@
+name: FSN Build & Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.2.3)'
+        required: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binaries: "zentinel zentinel-gateway"
+            archive: zentinel-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binaries: "zentinel zentinel-gateway"
+            archive: zentinel-linux-aarch64.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binaries: "zentinel zentinel-gateway"
+            archive: zentinel-macos-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binaries: "zentinel zentinel-gateway"
+            archive: zentinel-macos-aarch64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binaries: "zentinel.exe zentinel-gateway.exe"
+            archive: zentinel-windows-x86_64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev cmake \
+            libssl-dev pkg-config protobuf-compiler
+
+      - name: Install macOS/Windows build deps
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Windows build deps
+        if: runner.os == 'Windows'
+        run: choco install protoc
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p zentinel-proxy -p zentinel-gateway
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          for bin in ${{ matrix.binaries }}; do
+            cp target/${{ matrix.target }}/release/$bin .
+          done
+          tar czf ${{ matrix.archive }} ${{ matrix.binaries }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          foreach ($bin in "${{ matrix.binaries }}".Split(" ")) {
+            Copy-Item "target\${{ matrix.target }}\release\$bin" .
+          }
+          Compress-Archive -Path ${{ matrix.binaries }}.Split(" ") -DestinationPath ${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.version }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate fsn-package.toml
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          REPO="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          cat > fsn-package.toml << EOF
+          [package]
+          id = "zentinel"
+          name = "Zentinel"
+          version = "${VERSION}"
+          category = "server"
+          type = "app"
+          description = "High-performance reverse proxy with WebAssembly plugin support"
+          tags = ["proxy", "reverse-proxy", "gateway", "wasm", "load-balancer"]
+          icon = "zentinel"
+          upstream = "https://github.com/zentinelproxy/zentinel"
+
+          [app]
+          binaries = [
+            { os = "linux",   arch = "x86_64",  url = "${REPO}/zentinel-linux-x86_64.tar.gz" },
+            { os = "linux",   arch = "aarch64", url = "${REPO}/zentinel-linux-aarch64.tar.gz" },
+            { os = "macos",   arch = "x86_64",  url = "${REPO}/zentinel-macos-x86_64.tar.gz" },
+            { os = "macos",   arch = "aarch64", url = "${REPO}/zentinel-macos-aarch64.tar.gz" },
+            { os = "windows", arch = "x86_64",  url = "${REPO}/zentinel-windows-x86_64.zip" },
+          ]
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "Zentinel ${{ steps.ver.outputs.tag }}"
+          body: |
+            Native binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64).
+            Reverse proxy — upstream: https://github.com/zentinelproxy/zentinel
+          files: |
+            artifacts/*
+            fsn-package.toml
