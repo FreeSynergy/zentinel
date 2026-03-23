@@ -82,6 +82,7 @@ impl ReferenceGrantIndex {
     /// Returns `true` if either:
     /// - The source and target are in the same namespace (no grant needed)
     /// - A matching ReferenceGrant exists (all fields must match)
+    #[allow(clippy::too_many_arguments)]
     pub fn is_permitted(
         &self,
         source_namespace: &str,

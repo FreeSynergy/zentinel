@@ -302,7 +302,9 @@ impl HttpRouteReconciler {
         match ns_api.get(namespace).await {
             Ok(ns) => {
                 let ns_labels = ns.metadata.labels.unwrap_or_default();
-                match_labels.iter().all(|(k, v)| ns_labels.get(k) == Some(v))
+                match_labels
+                    .iter()
+                    .all(|(k, v)| ns_labels.get(k) == Some(v))
             }
             Err(e) => {
                 warn!(

@@ -356,7 +356,9 @@ impl GatewayReconciler {
         let generation = gateway.metadata.generation.unwrap_or(0);
         let now = chrono::Utc::now().to_rfc3339();
 
-        let attached_counts = self.count_attached_routes(gateway, &name, namespace).await?;
+        let attached_counts = self
+            .count_attached_routes(gateway, &name, namespace)
+            .await?;
         let wildcard_count = attached_counts.get("").copied().unwrap_or(0);
         let addresses = self.get_gateway_addresses(namespace).await;
 

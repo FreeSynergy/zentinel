@@ -153,13 +153,14 @@ impl ConfigTranslator {
                 let gw_ns = pr.namespace.as_deref().unwrap_or(&route_ns);
                 let gw_name = pr.name.as_str();
 
-                if let Some(gw) = our_gateways.iter().find(|g| {
-                    g.name_any() == gw_name && g.namespace().unwrap_or_default() == gw_ns
-                }) {
+                if let Some(gw) = our_gateways
+                    .iter()
+                    .find(|g| g.name_any() == gw_name && g.namespace().unwrap_or_default() == gw_ns)
+                {
                     // Check if route namespace is allowed by listener's allowedRoutes
                     let gw_namespace = gw.namespace().unwrap_or_default();
                     let route_allowed = self
-                        .is_route_namespace_allowed(gw, &route_ns, &gw_namespace, &client)
+                        .is_route_namespace_allowed(gw, &route_ns, &gw_namespace, client)
                         .await;
                     if !route_allowed {
                         debug!(
@@ -192,8 +193,9 @@ impl ConfigTranslator {
                 continue;
             }
 
-            let (route_configs, upstream_configs, filter_configs) =
-                self.translate_httproute(route, &listener_hostnames, &client).await?;
+            let (route_configs, upstream_configs, filter_configs) = self
+                .translate_httproute(route, &listener_hostnames, client)
+                .await?;
             routes.extend(route_configs);
             upstreams.extend(upstream_configs);
             filters.extend(filter_configs);
@@ -511,8 +513,9 @@ impl ConfigTranslator {
             let rule_id = format!("{route_ns}-{route_name}-rule{rule_idx}");
 
             // Build upstream from backend refs (shared across all match entries)
-            let (upstream_id, upstream) =
-                self.translate_backends(&rule_id, &rule.backend_refs, &route_ns, client).await?;
+            let (upstream_id, upstream) = self
+                .translate_backends(&rule_id, &rule.backend_refs, &route_ns, client)
+                .await?;
 
             let has_upstream = upstream.is_some();
             if let Some(upstream) = upstream {
@@ -785,11 +788,13 @@ impl ConfigTranslator {
                         .as_ref()
                         .and_then(|ports| ports.first())
                         .and_then(|p| p.port)
-                        .unwrap_or(svc_port as i32) as u16;
+                        .unwrap_or(svc_port) as u16;
 
                     for endpoint in &ep_slice.endpoints {
                         // Only use ready endpoints
-                        if !endpoint.conditions.as_ref()
+                        if !endpoint
+                            .conditions
+                            .as_ref()
                             .and_then(|c| c.ready)
                             .unwrap_or(true)
                         {
