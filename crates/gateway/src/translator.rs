@@ -1379,9 +1379,15 @@ impl ConfigTranslator {
             let weight = backend.weight.unwrap_or(1);
 
             if svc_ns != route_ns
-                && !self
-                    .reference_grants
-                    .is_permitted(route_ns, "gateway.networking.k8s.io", "TLSRoute", svc_ns, "", "Service", svc_name)
+                && !self.reference_grants.is_permitted(
+                    route_ns,
+                    "gateway.networking.k8s.io",
+                    "TLSRoute",
+                    svc_ns,
+                    "",
+                    "Service",
+                    svc_name,
+                )
             {
                 warn!(
                     route_ns = route_ns,
@@ -1458,12 +1464,10 @@ impl ConfigTranslator {
                             GatewayListenersAllowedRoutesNamespacesFrom::Selector => {
                                 if let Some(ref selector) = namespaces.selector {
                                     if let Some(ref match_labels) = selector.match_labels {
-                                        let ns_api: Api<
-                                            k8s_openapi::api::core::v1::Namespace,
-                                        > = Api::all(client.clone());
+                                        let ns_api: Api<k8s_openapi::api::core::v1::Namespace> =
+                                            Api::all(client.clone());
                                         if let Ok(ns) = ns_api.get(route_ns).await {
-                                            let ns_labels =
-                                                ns.metadata.labels.unwrap_or_default();
+                                            let ns_labels = ns.metadata.labels.unwrap_or_default();
                                             if match_labels
                                                 .iter()
                                                 .all(|(k, v)| ns_labels.get(k) == Some(v))

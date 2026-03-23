@@ -486,7 +486,7 @@ fn write_fallback_self_signed_cert(
     // Use rcgen to generate a self-signed certificate
     let subject_alt_names = vec!["localhost".to_string()];
     let cert = rcgen::generate_simple_self_signed(subject_alt_names)
-        .map_err(|e| std::io::Error::other(e))?;
+        .map_err(std::io::Error::other)?;
 
     std::fs::write(cert_path, cert.cert.pem())?;
     std::fs::write(key_path, cert.key_pair.serialize_pem())?;
