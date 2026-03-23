@@ -42,8 +42,36 @@ jobs:
             echo "has_vulnerabilities=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check for existing issue
+      - name: Write audit summary
         if: steps.audit.outputs.has_vulnerabilities == 'true'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "## :warning: Security Audit: vulnerabilities found"
+            echo ""
+            echo "\`cargo audit\` found vulnerabilities in the dependency tree."
+            echo ""
+            echo "<details>"
+            echo "<summary>Full output</summary>"
+            echo ""
+            echo '```'
+            cat audit-output.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check if issues are enabled
+        id: repo_meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ENABLED=$(gh api "repos/${{ github.repository }}" --jq '.has_issues')
+          echo "issues_enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing issue
+        if: steps.audit.outputs.has_vulnerabilities == 'true' && steps.repo_meta.outputs.issues_enabled == 'true'
         id: existing
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,7 +85,7 @@ jobs:
           fi
 
       - name: Create or update issue
-        if: steps.audit.outputs.has_vulnerabilities == 'true'
+        if: steps.audit.outputs.has_vulnerabilities == 'true' && steps.repo_meta.outputs.issues_enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -96,7 +124,7 @@ jobs:
           fi
 
       - name: Close resolved issue
-        if: steps.audit.outputs.has_vulnerabilities == 'false'
+        if: steps.audit.outputs.has_vulnerabilities == 'false' && steps.repo_meta.outputs.issues_enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
